@@ -1,0 +1,12 @@
+pywebview>=6.2
+Pillow
+psutil
+requests
+# customtkinter/tkinterdnd2 intentionally NOT required by backend/ anymore.
+# core/utils.py's two CTk-specific functions (make_thumb, make_thumb_min_edge)
+# still import customtkinter defensively (see comment in that file) but are
+# not called by bridge.py yet -- they'll be replaced with a plain-PIL +
+# base64 <img> path in Stage 4/5, at which point this note goes away.
+
+# --- build-only, not needed to run from source ---
+pyinstaller
