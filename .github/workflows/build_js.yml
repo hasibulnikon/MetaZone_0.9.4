@@ -1,0 +1,184 @@
+name: Build Windows EXE (JS frontend)
+
+# This builds the NEW pywebview/JS-frontend MetaZone (this folder),
+# not the original CustomTkinter app. Adapted from the original app's
+# .github/workflows/build.yml — same real-ExifTool-not-choco-stub
+# logic (proven necessary there), same exiftool_pkg bundling path that
+# core/utils.py's find_exiftool() already looks for when frozen.
+#
+# UNTESTED: this workflow has never actually been run. It was written
+# by adapting the original, working build.yml as closely as possible,
+# but the JS-frontend app itself has only ever been verified on Linux
+# in a sandbox (see CHANGELOG.md's Stage 8 entry) — WebView2 behavior,
+# whether pywebview needs extra Windows-only dependencies, and whether
+# this exact PyInstaller invocation succeeds are all real open
+# questions this workflow exists to actually answer. Expect to iterate
+# on this after the first run's logs come back.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'MetaZone_js/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: MetaZone_js
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Read app version
+        id: appver
+        shell: pwsh
+        run: |
+          $line = Select-String -Path "backend\core\constants.py" -Pattern 'APP_VERSION\s*=\s*"([^"]+)"'
+          if (-not $line) {
+            Write-Error "Could not find APP_VERSION in backend/core/constants.py"; exit 1
+          }
+          $version = $line.Matches[0].Groups[1].Value
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "App version: $version"
+
+      - name: Install ExifTool
+        shell: pwsh
+        run: |
+          # community.chocolatey.org has occasional outages that return
+          # a 503 on the package feed (seen for real: "Response status
+          # code does not indicate success: 503 (Service Unavailable)"
+          # -> "Unable to find package 'exiftool'"). That's Chocolatey's
+          # servers, not this workflow or the app, but `choco install`
+          # doesn't retry on its own -- so retry here with backoff
+          # instead of failing the whole build on a transient blip.
+          $maxAttempts = 5
+          $installed = $false
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "choco install exiftool -y --no-progress (attempt $attempt/$maxAttempts)"
+            choco install exiftool -y --no-progress
+            if ($LASTEXITCODE -eq 0) {
+              $installed = $true
+              break
+            }
+            Write-Host "choco install failed (exit $LASTEXITCODE) -- likely a transient Chocolatey feed issue. Retrying..."
+            if ($attempt -lt $maxAttempts) {
+              Start-Sleep -Seconds ([Math]::Min(60, [Math]::Pow(2, $attempt) * 5))
+            }
+          }
+          if (-not $installed) {
+            Write-Error "choco install exiftool failed after $maxAttempts attempts. This looks like a Chocolatey community feed outage (community.chocolatey.org returned 503), not an app or workflow bug -- check https://status.chocolatey.org/ and re-run the workflow once it recovers."
+            exit 1
+          }
+
+          # Same real binary vs. Chocolatey ShimGen stub issue already
+          # solved in the original app's workflow: grab the actual
+          # exiftool.exe + its exiftool_files runtime folder from
+          # choco's lib/tools directory, not the PATH shim.
+          $realExe = Get-ChildItem "C:\ProgramData\chocolatey\lib\exiftool\tools" `
+            -Recurse -Filter "exiftool.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $realExe) {
+            Write-Error "Could not find exiftool.exe under chocolatey\lib\exiftool\tools — choco install may have failed or the package layout changed."
+            exit 1
+          }
+          $srcDir = $realExe.Directory.FullName
+          $filesDir = Join-Path $srcDir "exiftool_files"
+          if (-not (Test-Path $filesDir)) {
+            Write-Error "Found exiftool.exe at $($realExe.FullName) but no sibling exiftool_files folder — the app will crash at runtime without it."
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "C:\ExifTool" | Out-Null
+          Copy-Item $realExe.FullName "C:\ExifTool\exiftool.exe" -Force
+          Copy-Item $filesDir "C:\ExifTool\exiftool_files" -Recurse -Force
+          Write-Host "ExifTool exe: $((Get-Item 'C:\ExifTool\exiftool.exe').Length) bytes"
+
+      - name: Build EXE with PyInstaller
+        shell: pwsh
+        run: |
+          $icon_arg = ""
+          if (Test-Path "icon.ico") { $icon_arg = "--icon=icon.ico" }
+
+          $pyinstaller_args = @(
+            "--onefile",
+            "--windowed",
+            "--name=MetaZone",
+            "--add-data=frontend;frontend",
+            "--add-data=backend;backend",
+            "--add-data=C:\ExifTool\exiftool.exe;exiftool_pkg",
+            "--add-data=C:\ExifTool\exiftool_files;exiftool_pkg\exiftool_files",
+            "--collect-all=Pillow",
+            "--hidden-import=sqlite3"
+          )
+
+          if ($icon_arg) { $pyinstaller_args += $icon_arg }
+          if (Test-Path "icon.ico") { $pyinstaller_args += "--add-data=icon.ico;." }
+
+          $pyinstaller_args += "app.py"
+
+          Write-Host "pyinstaller $($pyinstaller_args -join ' ')"
+          & python -m PyInstaller @pyinstaller_args
+
+      - name: Verify EXE was created
+        shell: pwsh
+        run: |
+          if (Test-Path "dist\MetaZone.exe") {
+            Write-Host "SUCCESS: $((Get-Item 'dist\MetaZone.exe').Length / 1MB) MB"
+          } else {
+            Write-Error "MetaZone.exe not found!"; exit 1
+          }
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MetaZone-JS-Windows
+          path: MetaZone_js\dist\MetaZone.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: js-${{ steps.appver.outputs.version }}
+          name: MetaZone (JS Frontend) ${{ steps.appver.outputs.version }}
+          body: |
+            ## MetaZone (JS Frontend) ${{ steps.appver.outputs.version }}
+
+            New pywebview + HTML/JS frontend, real Python backend
+            underneath (unchanged metadata/embedding/AI logic). Built
+            to replace the old CustomTkinter UI, which felt sluggish
+            on large batches.
+
+            ### Status
+            This is an active migration — most screens are real and
+            working (Meta Generator, Meta Embedder, Settings,
+            Dashboard, Prompt-to-Prompt), but this build has not yet
+            been manually verified on a real Windows machine. Please
+            test and report back anything broken.
+
+            Not yet included: Image-to-Prompt mode, Smart Workflow,
+            real drag-and-drop file import (use the Browse button for
+            now).
+
+            ### How to use
+            1. Download **MetaZone.exe** — double-click, no install needed
+            2. Open **Settings**, add your API key(s)
+            3. Click **Browse images…** to import (drag-and-drop not
+               wired up yet)
+            4. Click **Generate**
+            5. Use **Meta Embedder** to write metadata into your files
+          files: MetaZone_js\dist\MetaZone.exe
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
